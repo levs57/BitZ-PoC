@@ -349,7 +349,10 @@ impl<'a> Forest<'a> {
         let mut tables = self.fold_table(ell, prior, &challenges);
         let eq_c = eq_table(&external[..s]);
         let eq_y = eq_table(&external[s..s + low_bits - 2]);
+        super::trace(&format!("    L{ell} cached tables"), started);
+        let grid_started = std::time::Instant::now();
         let grid = self.merged_round_sums(&tables, ell, prior, &eq_c, &eq_y);
+        super::trace(&format!("    L{ell} cached grid"), grid_started);
         super::trace(&format!("    L{ell} cached rounds"), started);
 
         let one = Gf::one();
@@ -679,8 +682,7 @@ impl<'a> Forest<'a> {
         debug_assert_eq!(tables.len, 16);
         debug_assert_eq!(eq_y.len(), rows);
         let eq_t = transposed_eq(eq_c);
-        let row = |y2: usize, buckets: &mut MergedBuckets| {
-            buckets.clear();
+        let row = |y2: usize, scratch: &mut MergedScratch| {
             let tab: [&[Gf]; 8] = std::array::from_fn(|corner| {
                 let (p, b1, b2) = (corner >> 2, (corner >> 1) & 1, corner & 1);
                 tables.at(
@@ -691,29 +693,36 @@ impl<'a> Forest<'a> {
                 )
             });
             for g in 0..groups {
-                let mut pats = [[0u8; 64]; 8];
                 for corner in 0..8 {
                     let (p, b1, b2) = (corner >> 2, (corner >> 1) & 1, corner & 1);
                     let y = y2 | (b2 << (low_bits - 2)) | (b1 << (low_bits - 1));
                     let mut words = [0u64; 8];
                     self.corner_words(ell, prior, p, y, g, &mut words);
-                    pats[corner] = transposed_patterns(&mut words);
-                }
-                let weights = &eq_t[g << 6..(g + 1) << 6];
-                for e in 0..4 {
-                    for o in 0..4 {
-                        let mut index = [0u8; 64];
-                        for m in 0..64 {
-                            index[m] = (pats[e][m] << 4) | pats[4 + o][m];
-                        }
-                        kernels::scatter_add(buckets.get_mut(4 * e + o), &index, weights);
-                    }
+                    scratch.patterns[8 * g + corner] = transposed_patterns(&mut words);
                 }
             }
 
-            let terms: [Gf; 16] = std::array::from_fn(|i| {
-                kernels::contract(tab[i >> 2], tab[4 + (i & 3)], buckets.get(i))
-            });
+            let mut terms = [Gf::zero(); 16];
+            for e in 0..4 {
+                for o in 0..4 {
+                    scratch.bucket.fill(Gf::zero());
+                    for g in 0..groups {
+                        let pe = &scratch.patterns[8 * g + e];
+                        let po = &scratch.patterns[8 * g + 4 + o];
+                        let mut index = [0u8; 64];
+                        for m in 0..64 {
+                            index[m] = (pe[m] << 4) | po[m];
+                        }
+                        kernels::scatter_add(
+                            &mut scratch.bucket,
+                            &index,
+                            &eq_t[g << 6..(g + 1) << 6],
+                        );
+                    }
+                    terms[4 * e + o] =
+                        kernels::contract(tab[e], tab[4 + o], &scratch.bucket);
+                }
+            }
             let mut grid = [Gf::zero(); 9];
             grid[0] = terms[0];
             grid[1] = terms[10];
@@ -732,12 +741,12 @@ impl<'a> Forest<'a> {
         let partials: Vec<[Gf; 9]> = (0..rows)
             .into_par_iter()
             .with_min_len(1)
-            .map_init(MergedBuckets::new, |buckets, y2| row(y2, buckets))
+            .map_init(|| MergedScratch::new(groups), |scratch, y2| row(y2, scratch))
             .collect();
         #[cfg(not(feature = "parallel"))]
         let partials: Vec<[Gf; 9]> = {
-            let mut buckets = MergedBuckets::new();
-            (0..rows).map(|y2| row(y2, &mut buckets)).collect()
+            let mut scratch = MergedScratch::new(groups);
+            (0..rows).map(|y2| row(y2, &mut scratch)).collect()
         };
         partials.into_iter().fold([Gf::zero(); 9], |mut total, part| {
             for i in 0..9 {
@@ -1241,28 +1250,19 @@ impl<'a> Forest<'a> {
     }
 }
 
-/// Sixteen 256-entry pair buckets for the cached two-round grid.
-struct MergedBuckets {
-    data: Vec<Gf>,
+/// Per-task scratch for the cached two-round grid. Patterns are retained so
+/// one 256-entry pair bucket stays hot while all column groups feed it.
+struct MergedScratch {
+    bucket: Vec<Gf>,
+    patterns: Vec<[u8; 64]>,
 }
 
-impl MergedBuckets {
-    fn new() -> Self {
+impl MergedScratch {
+    fn new(groups: usize) -> Self {
         Self {
-            data: vec![Gf::zero(); 16 * 256],
+            bucket: vec![Gf::zero(); 256],
+            patterns: vec![[0u8; 64]; 8 * groups],
         }
-    }
-
-    fn clear(&mut self) {
-        self.data.fill(Gf::zero());
-    }
-
-    fn get(&self, i: usize) -> &[Gf] {
-        &self.data[i * 256..(i + 1) * 256]
-    }
-
-    fn get_mut(&mut self, i: usize) -> &mut [Gf] {
-        &mut self.data[i * 256..(i + 1) * 256]
     }
 }
 

@@ -6,13 +6,11 @@
 //! column `c` is a function of the `2^ℓ` bits of column `c` under it —
 //! a per-position table with `2^{2^ℓ}` entries. Folding the sumcheck's first
 //! `k` rounds into such a table keeps that shape (`2^{2^{ℓ+k}}` entries), so
-//! levels with `ℓ + k ≤ 3` run their first `k` rounds straight off the
-//! packed bits through 256-entry tables ([`Forest::bit_round`]), their next
-//! two rounds through table lookups ([`Forest::jit_round_sums`],
-//! [`Forest::jit_fold_round`] — the second writes the once-folded halves
-//! into one arena shared by all these levels), and only then hand a
-//! materialised table to the dense rounds. Level 3 is never materialised
-//! either: its dense rounds start the same way, and level 4 is built as
+//! levels below 3 run their first rounds straight off the packed bits, cache
+//! the 3-by-3 grid for the next two ordinary rounds, then materialise the
+//! following round into one arena shared by all these levels. Level 3 is
+//! never materialised either: its dense rounds start through table lookups,
+//! and level 4 is built as
 //! pairwise products of its table values; the levels above are products of
 //! the level below. The round sums are the same field sums their dense pass
 //! computes, so every message is byte-identical.
@@ -63,6 +61,26 @@ impl Tables {
             .for_each(|(i, values)| {
                 let side = (i * chunk_len / side_len) & 1;
                 kernels::scale_in_place(values, &weights[side]);
+            });
+    }
+
+    /// Absorb two adjacent folds into the four corresponding position
+    /// tables after their ordinary round messages have been emitted.
+    fn scale_fold2(&mut self, low_bits: usize, r1: Gf, r2: Gf) {
+        let side_len = (1usize << (low_bits - 2)) * self.len;
+        let chunk_len = PARALLEL_MIN_LANES.min(side_len);
+        let one = Gf::one();
+        let weights = [
+            (one - r1) * (one - r2),
+            (one - r1) * r2,
+            r1 * (one - r2),
+            r1 * r2,
+        ];
+        cfg_chunks_mut!(self.data, chunk_len)
+            .enumerate()
+            .for_each(|(i, values)| {
+                let corner = (i * chunk_len / side_len) & 3;
+                kernels::scale_in_place(values, &weights[corner]);
             });
     }
 }
@@ -165,7 +183,12 @@ impl<'a> Forest<'a> {
                 prove_layer_tensor(ps, point, l, r, 0, Gf::one(), VecDeque::new(), self.s)
             } else if self.jit() {
                 let tables = if ell == MATERIALISED_LEVEL { tables3.take() } else { None };
-                self.prove_jit_level(ps, ell, point, tables, &mut arena)
+                if ell < MATERIALISED_LEVEL {
+                    debug_assert!(tables.is_none());
+                    self.prove_merged_level(ps, ell, point, &mut arena)
+                } else {
+                    self.prove_jit_level(ps, ell, point, tables, &mut arena)
+                }
             } else {
                 self.prove_bit_level(ps, ell, point)
             };
@@ -279,6 +302,92 @@ impl<'a> Forest<'a> {
         let half = arena.len() / 2;
         let (l, r) = arena.split_at_mut(half);
         let out = prove_dense_rounds(ps, point, l, r, k + 2, Some(r2), factor, next_point, s);
+        super::trace(&format!("    L{ell} dense tail"), started);
+        out
+    }
+
+    /// Cache the full 3-by-3 grid for two adjacent rounds, then emit the
+    /// same two ordinary Gruen messages as [`Forest::prove_jit_level`]. The
+    /// transcript and verifier remain unchanged; only the prover avoids a
+    /// second packed-bit pass.
+    fn prove_merged_level(
+        &self,
+        ps: &mut ProverState,
+        ell: usize,
+        point: Point,
+        arena: &mut Vec<Gf>,
+    ) -> (Point, Gf) {
+        let s = self.s;
+        let k = MATERIALISED_LEVEL - ell;
+        let prior = k - 1;
+        let external: Vec<Gf> = point.iter().rev().copied().collect();
+        let (challenges, mut factor, mut next_point) =
+            self.bit_rounds(ps, ell, prior, &point, &external);
+        let low_bits = self.t - ell - 1 - prior;
+        debug_assert!(low_bits >= 3);
+
+        let started = std::time::Instant::now();
+        let mut tables = self.fold_table(ell, prior, &challenges);
+        let eq_c = eq_table(&external[..s]);
+        let eq_y = eq_table(&external[s..s + low_bits - 2]);
+        let grid = self.merged_round_sums(&tables, ell, prior, &eq_c, &eq_y);
+        super::trace(&format!("    L{ell} cached rounds"), started);
+
+        let one = Gf::one();
+        let z1 = point[prior];
+        let z2 = point[prior + 1];
+        let first = [
+            (one - z2) * grid[0] + z2 * grid[3],
+            (one - z2) * grid[1] + z2 * grid[4],
+            (one - z2) * grid[2] + z2 * grid[5],
+        ];
+        let endpoint = if z1 == Gf::zero() { first[1] } else { first[0] };
+        ps.prover_message(&[factor * endpoint, factor * first[2]]);
+        let r1: Gf = ps.verifier_message();
+        next_point.push_back(r1);
+        factor = factor * eq_factor(r1, z1);
+
+        let evaluate = |values: [Gf; 3]| {
+            values[0] + r1 * ((values[1] - values[0]) + (r1 - one) * values[2])
+        };
+        let second = [
+            evaluate([grid[0], grid[1], grid[2]]),
+            evaluate([grid[3], grid[4], grid[5]]),
+            evaluate([grid[6], grid[7], grid[8]]),
+        ];
+        let endpoint = if z2 == Gf::zero() { second[1] } else { second[0] };
+        ps.prover_message(&[factor * endpoint, factor * second[2]]);
+        let r2: Gf = ps.verifier_message();
+        next_point.push_back(r2);
+        factor = factor * eq_factor(r2, z2);
+
+        let started = std::time::Instant::now();
+        tables.scale_fold2(low_bits, r1, r2);
+        let z3 = point[prior + 2];
+        let send_one = z3 == Gf::zero();
+        let eq_y = eq_table(&external[s..s + low_bits - 3]);
+        let (sum_endpoint, sum_inf) =
+            self.merged_fold_round(&tables, ell, prior, &eq_c, &eq_y, send_one, arena);
+        super::trace(&format!("    L{ell} cached fold"), started);
+        ps.prover_message(&[factor * sum_endpoint, factor * sum_inf]);
+        let r3: Gf = ps.verifier_message();
+        next_point.push_back(r3);
+        factor = factor * eq_factor(r3, z3);
+
+        let started = std::time::Instant::now();
+        let half = arena.len() / 2;
+        let (l, r) = arena.split_at_mut(half);
+        let out = prove_dense_rounds(
+            ps,
+            point,
+            l,
+            r,
+            prior + 3,
+            Some(r3),
+            factor,
+            next_point,
+            s,
+        );
         super::trace(&format!("    L{ell} dense tail"), started);
         out
     }
@@ -531,6 +640,94 @@ impl<'a> Forest<'a> {
         unsafe { arena.set_len(total) };
     }
 
+    /// The tensor grid for two adjacent rounds through the 16-entry tables
+    /// present after `prior = 2 - ell` ordinary bit rounds. Grid order is
+    /// `(0,0), (1,0), (inf,0), (0,1), (1,1), (inf,1), (0,inf), (1,inf),
+    /// `(inf,inf)`.
+    fn merged_round_sums(
+        &self,
+        tables: &Tables,
+        ell: usize,
+        prior: usize,
+        eq_c: &[Gf],
+        eq_y: &[Gf],
+    ) -> [Gf; 9] {
+        let low_bits = self.t - ell - 1 - prior;
+        let cols = 1usize << self.s;
+        let groups = cols.div_ceil(64);
+        let rows = 1usize << (low_bits - 2);
+        debug_assert_eq!(ell + prior, 2);
+        debug_assert_eq!(tables.len, 16);
+        debug_assert_eq!(eq_y.len(), rows);
+        let eq_t = transposed_eq(eq_c);
+        let row = |y2: usize, buckets: &mut MergedBuckets| {
+            buckets.clear();
+            let tab: [&[Gf]; 8] = std::array::from_fn(|corner| {
+                let (p, b1, b2) = (corner >> 2, (corner >> 1) & 1, corner & 1);
+                tables.at(
+                    (p << low_bits)
+                        | (b1 << (low_bits - 1))
+                        | (b2 << (low_bits - 2))
+                        | y2,
+                )
+            });
+            for g in 0..groups {
+                let mut pats = [[0u8; 64]; 8];
+                for corner in 0..8 {
+                    let (p, b1, b2) = (corner >> 2, (corner >> 1) & 1, corner & 1);
+                    let y = y2 | (b2 << (low_bits - 2)) | (b1 << (low_bits - 1));
+                    let mut words = [0u64; 8];
+                    self.corner_words(ell, prior, p, y, g, &mut words);
+                    pats[corner] = transposed_patterns(&mut words);
+                }
+                let weights = &eq_t[g << 6..(g + 1) << 6];
+                for e in 0..4 {
+                    for o in 0..4 {
+                        let mut index = [0u8; 64];
+                        for m in 0..64 {
+                            index[m] = (pats[e][m] << 4) | pats[4 + o][m];
+                        }
+                        kernels::scatter_add(buckets.get_mut(4 * e + o), &index, weights);
+                    }
+                }
+            }
+
+            let terms: [Gf; 16] = std::array::from_fn(|i| {
+                kernels::contract(tab[i >> 2], tab[4 + (i & 3)], buckets.get(i))
+            });
+            let mut grid = [Gf::zero(); 9];
+            grid[0] = terms[0];
+            grid[1] = terms[10];
+            grid[2] = terms[0] + terms[2] + terms[8] + terms[10];
+            grid[3] = terms[5];
+            grid[4] = terms[15];
+            grid[5] = terms[5] + terms[7] + terms[13] + terms[15];
+            grid[6] = terms[0] + terms[1] + terms[4] + terms[5];
+            grid[7] = terms[10] + terms[11] + terms[14] + terms[15];
+            grid[8] = terms.into_iter().fold(Gf::zero(), |sum, value| sum + value);
+            let weight = eq_y[y2];
+            grid.map(|value| value * weight)
+        };
+
+        #[cfg(feature = "parallel")]
+        let partials: Vec<[Gf; 9]> = (0..rows)
+            .into_par_iter()
+            .with_min_len(1)
+            .map_init(MergedBuckets::new, |buckets, y2| row(y2, buckets))
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let partials: Vec<[Gf; 9]> = {
+            let mut buckets = MergedBuckets::new();
+            (0..rows).map(|y2| row(y2, &mut buckets)).collect()
+        };
+        partials.into_iter().fold([Gf::zero(); 9], |mut total, part| {
+            for i in 0..9 {
+                total[i] += part[i];
+            }
+            total
+        })
+    }
+
     /// Round `k + 1` of level `ell` through its `k`-fold tables: the sums
     /// over `(y1, c)` of the corners `(p, b1, y1)`, `b1` the bit bound this
     /// round, weighted `eq_y[y1]·eq_c[c]`.
@@ -688,6 +885,116 @@ impl<'a> Forest<'a> {
                 let (end, inf) = sums.finish();
                 let w = eq_y[y2];
                 (end * w, inf * w)
+            })
+            .collect();
+        partials
+            .into_iter()
+            .fold((Gf::zero(), Gf::zero()), |(a, b), (x, y)| (a + x, b + y))
+    }
+
+    /// Materialise the following ordinary round after two cached rounds,
+    /// and accumulate that round's Gruen message in the same pass.
+    #[allow(clippy::too_many_arguments)]
+    fn merged_fold_round(
+        &self,
+        tables: &Tables,
+        ell: usize,
+        prior: usize,
+        eq_c: &[Gf],
+        eq_y: &[Gf],
+        send_one: bool,
+        arena: &mut Vec<Gf>,
+    ) -> (Gf, Gf) {
+        let low_bits = self.t - ell - 1 - prior;
+        let cols = 1usize << self.s;
+        let rows = 1usize << (low_bits - 3);
+        let len = 4 * rows * cols;
+        debug_assert_eq!(eq_y.len(), rows);
+        assert!(arena.capacity() >= len, "arena too small");
+        if arena.len() != len {
+            arena.clear();
+            let spare = &mut arena.spare_capacity_mut()[..len];
+            let sums = self.merged_fold_into(tables, ell, prior, eq_c, eq_y, send_one, spare);
+            // SAFETY: `merged_fold_into` writes every slot.
+            unsafe { arena.set_len(len) };
+            sums
+        } else {
+            let slots = &mut arena[..len];
+            // SAFETY: the view is used only to overwrite every slot.
+            let view = unsafe {
+                std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<MaybeUninit<Gf>>(), len)
+            };
+            self.merged_fold_into(tables, ell, prior, eq_c, eq_y, send_one, view)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merged_fold_into(
+        &self,
+        tables: &Tables,
+        ell: usize,
+        prior: usize,
+        eq_c: &[Gf],
+        eq_y: &[Gf],
+        send_one: bool,
+        out: &mut [MaybeUninit<Gf>],
+    ) -> (Gf, Gf) {
+        let low_bits = self.t - ell - 1 - prior;
+        let cols = 1usize << self.s;
+        let groups = cols.div_ceil(64);
+        let rows = 1usize << (low_bits - 3);
+        let quarter = rows * cols;
+        let (e_lo, rest) = out.split_at_mut(quarter);
+        let (e_hi, rest) = rest.split_at_mut(quarter);
+        let (o_lo, o_hi) = rest.split_at_mut(quarter);
+        let eq_t = transposed_eq(eq_c);
+        let partials: Vec<(Gf, Gf)> = cfg_chunks_mut!(e_lo, cols)
+            .zip(cfg_chunks_mut!(e_hi, cols))
+            .zip(cfg_chunks_mut!(o_lo, cols))
+            .zip(cfg_chunks_mut!(o_hi, cols))
+            .enumerate()
+            .map(|(y3, (((el, eh), ol), oh))| {
+                let tab: [&[Gf]; 16] = std::array::from_fn(|corner| {
+                    let (p, b1, b2, b3) =
+                        (corner >> 3, (corner >> 2) & 1, (corner >> 1) & 1, corner & 1);
+                    tables.at(
+                        (p << low_bits)
+                            | (b1 << (low_bits - 1))
+                            | (b2 << (low_bits - 2))
+                            | (b3 << (low_bits - 3))
+                            | y3,
+                    )
+                });
+                let mut sums = kernels::Sums::zero();
+                for g in 0..groups {
+                    let mut pats = [[0u8; 64]; 16];
+                    for corner in 0..16 {
+                        let (p, b1, b2, b3) =
+                            (corner >> 3, (corner >> 2) & 1, (corner >> 1) & 1, corner & 1);
+                        let y = y3
+                            | (b3 << (low_bits - 3))
+                            | (b2 << (low_bits - 2))
+                            | (b1 << (low_bits - 1));
+                        let mut words = [0u64; 8];
+                        self.corner_words(ell, prior, p, y, g, &mut words);
+                        pats[corner] = transposed_patterns(&mut words);
+                    }
+                    let base_c = g << 6;
+                    let width = 64.min(cols - base_c);
+                    let range = base_c..base_c + width;
+                    kernels::jit_fold2_group(
+                        tab,
+                        &pats,
+                        &eq_t[g << 6..(g + 1) << 6],
+                        send_one,
+                        [&mut el[range.clone()], &mut eh[range.clone()]],
+                        [&mut ol[range.clone()], &mut oh[range]],
+                        &mut sums,
+                    );
+                }
+                let (end, inf) = sums.finish();
+                let weight = eq_y[y3];
+                (end * weight, inf * weight)
             })
             .collect();
         partials
@@ -912,6 +1219,31 @@ impl<'a> Forest<'a> {
             + kernels::contract(t_e_lo, t_o_hi, &bk.lh[..pairs])
             + ll;
         (end, inf)
+    }
+}
+
+/// Sixteen 256-entry pair buckets for the cached two-round grid.
+struct MergedBuckets {
+    data: Vec<Gf>,
+}
+
+impl MergedBuckets {
+    fn new() -> Self {
+        Self {
+            data: vec![Gf::zero(); 16 * 256],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.fill(Gf::zero());
+    }
+
+    fn get(&self, i: usize) -> &[Gf] {
+        &self.data[i * 256..(i + 1) * 256]
+    }
+
+    fn get_mut(&mut self, i: usize) -> &mut [Gf] {
+        &mut self.data[i * 256..(i + 1) * 256]
     }
 }
 

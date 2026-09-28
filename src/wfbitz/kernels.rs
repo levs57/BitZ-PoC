@@ -174,6 +174,11 @@ impl Sums {
     pub(crate) fn finish(self) -> (Gf, Gf) {
         self.0.finish()
     }
+
+    #[inline(always)]
+    fn slot(&mut self, w: Gf, l0: Gf, l1: Gf, r0: Gf, r1: Gf, send_one: bool) {
+        self.0.slot(w, l0, l1, r0, r1, send_one);
+    }
 }
 
 /// One group of the first just-in-time dense round, slot by slot: `tab[i]`
@@ -271,6 +276,43 @@ pub(crate) fn jit_fold_group<const PRE_SCALED: bool>(
     neon::jit_fold_group::<PRE_SCALED>(tab, pat, rho, eq_t, send_one, out_l, out_r, &mut sums.0);
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     generic::jit_fold_group::<PRE_SCALED>(tab, pat, rho, eq_t, send_one, out_l, out_r, &mut sums.0);
+}
+
+/// One group after a bivariate pivotal round. The sixteen tables are ordered
+/// by `(half, b1, b2, b3)`; their `b1,b2` weights have already been absorbed.
+/// XOR the four lookups for each `(half,b3)`, write the ordinary round's four
+/// corners, and accumulate that round's Gruen message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn jit_fold2_group(
+    tab: [&[Gf]; 16],
+    pat: &[[u8; 64]; 16],
+    eq_t: &[Gf],
+    send_one: bool,
+    out_l: [&mut [MaybeUninit<Gf>]; 2],
+    out_r: [&mut [MaybeUninit<Gf>]; 2],
+    sums: &mut Sums,
+) {
+    assert_eq!(eq_t.len(), 64);
+    let [out_l0, out_l1] = out_l;
+    let [out_r0, out_r1] = out_r;
+    let width = out_l0.len();
+    assert!(out_l1.len() == width && out_r0.len() == width && out_r1.len() == width);
+    for m in 0..64 {
+        let c = col_of(m);
+        if c >= width {
+            continue;
+        }
+        let v = |i: usize| tab[i][pat[i][m] as usize];
+        let l0 = v(0b0000) + v(0b0010) + v(0b0100) + v(0b0110);
+        let l1 = v(0b0001) + v(0b0011) + v(0b0101) + v(0b0111);
+        let r0 = v(0b1000) + v(0b1010) + v(0b1100) + v(0b1110);
+        let r1 = v(0b1001) + v(0b1011) + v(0b1101) + v(0b1111);
+        out_l0[c].write(l0);
+        out_l1[c].write(l1);
+        out_r0[c].write(r0);
+        out_r1[c].write(r1);
+        sums.slot(eq_t[m], l0, l1, r0, r1, send_one);
+    }
 }
 
 /// Multiply every value by the same scalar.
@@ -429,7 +471,7 @@ pub(crate) mod generic {
 
         /// `end += (w·l_end)·r_end`, `inf += (w·(l1 − l0))·(r1 − r0)`.
         #[inline(always)]
-        fn slot(&mut self, w: Gf, l0: Gf, l1: Gf, r0: Gf, r1: Gf, send_one: bool) {
+        pub(super) fn slot(&mut self, w: Gf, l0: Gf, l1: Gf, r0: Gf, r1: Gf, send_one: bool) {
             let (le, re) = if send_one { (l1, r1) } else { (l0, r0) };
             let el = w * le;
             <Gf as WideMulAcc>::wide_add_assign(&mut self.end, &<Gf as WideMulAcc>::mul_wide(&el, &re));
@@ -823,6 +865,20 @@ pub(crate) mod neon {
         pub(crate) fn finish(self) -> (Gf, Gf) {
             // SAFETY: as `neon::pmull_lo`.
             unsafe { (to_elt(self.end), to_elt(self.inf)) }
+        }
+
+        #[inline(always)]
+        pub(super) fn slot(&mut self, w: Gf, l0: Gf, l1: Gf, r0: Gf, r1: Gf, send_one: bool) {
+            // SAFETY: all values are ordinary field elements loaded into
+            // vectors; the accumulators are owned by `self`.
+            unsafe {
+                let g = vdupq_n_u64(0x87);
+                let z = vdupq_n_u64(0);
+                slot(
+                    ld(&w), ld(&l0), ld(&l1), ld(&r0), ld(&r1), send_one,
+                    g, z, &mut self.end, &mut self.inf,
+                );
+            }
         }
     }
 

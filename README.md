@@ -396,6 +396,18 @@ tooling; tables default to `outputs/tables/` and figures to `outputs/figures/`
 there.
 <!-- bench-campaigns:end -->
 
+### Cached-round forest benchmark
+
+For a side-by-side comparison of the cached two-round prover with its
+pre-optimization baseline, run the same command on the current revision and
+on commit `a3be3bd`. Compare the reported `gkr` and `grand products` times.
+
+```bash
+RUSTFLAGS="-C target-cpu=native -A warnings" RAYON_NUM_THREADS=1 \
+  cargo run --release --no-default-features --features bitz-parity \
+  --example wfbitz_bench -- 26 --reps 5 --ladder fast
+```
+
 ### Raw performance of BitZ PCS on the core LinBitsRings relation
 
 ```sh

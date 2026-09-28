@@ -398,15 +398,19 @@ there.
 
 ### Cached-round forest benchmark
 
-For a side-by-side comparison of the cached two-round prover with its
-pre-optimization baseline, run the same command on the current revision and
-on commit `a3be3bd`. Compare the reported `gkr` and `grand products` times.
+For a same-process comparison of the cached two-round prover with the ordinary
+round path, run:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native -A warnings" RAYON_NUM_THREADS=1 \
-  cargo run --release --no-default-features --features bitz-parity \
-  --example wfbitz_bench -- 26 --reps 5 --ladder fast
+  cargo run --release --no-default-features \
+  --features bitz-parity,bench-internals \
+  --example wfbitz_bench -- 26 --reps 5 --ladder fast \
+  --compare-cached-rounds
 ```
+
+Both modes reuse one instance and commitment. Their samples run in alternating
+order; compare the separately reported `gkr` and `grand products` medians.
 
 ### Raw performance of BitZ PCS on the core LinBitsRings relation
 

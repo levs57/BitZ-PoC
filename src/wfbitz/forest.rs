@@ -119,6 +119,25 @@ impl<'a> Forest<'a> {
     /// Their `gpgkr_prove` over this tree: from the claim at `zeta` on the
     /// roots down to the leaf point and the claimed leaf value.
     pub(crate) fn prove(&self, ps: &mut ProverState, zeta: &[Gf]) -> (Vec<Gf>, Gf) {
+        self.prove_inner(ps, zeta, true)
+    }
+
+    #[cfg(feature = "bench-internals")]
+    pub(crate) fn prove_with_cached_rounds(
+        &self,
+        ps: &mut ProverState,
+        zeta: &[Gf],
+        cached_rounds: bool,
+    ) -> (Vec<Gf>, Gf) {
+        self.prove_inner(ps, zeta, cached_rounds)
+    }
+
+    fn prove_inner(
+        &self,
+        ps: &mut ProverState,
+        zeta: &[Gf],
+        cached_rounds: bool,
+    ) -> (Vec<Gf>, Gf) {
         let t = self.t;
         let started = std::time::Instant::now();
         // The materialised path for tiny `t`: level 3 in full, the levels
@@ -183,7 +202,7 @@ impl<'a> Forest<'a> {
                 prove_layer_tensor(ps, point, l, r, 0, Gf::one(), VecDeque::new(), self.s)
             } else if self.jit() {
                 let tables = if ell == MATERIALISED_LEVEL { tables3.take() } else { None };
-                if ell < MATERIALISED_LEVEL {
+                if cached_rounds && ell < MATERIALISED_LEVEL {
                     debug_assert!(tables.is_none());
                     self.prove_merged_level(ps, ell, point, &mut arena)
                 } else {

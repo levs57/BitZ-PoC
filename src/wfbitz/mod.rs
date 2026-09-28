@@ -78,6 +78,8 @@ pub const WINDOW: usize = 8;
 pub struct BitZProver {
     params: BitZParams,
     comb: FixedBasePow,
+    #[cfg(feature = "bench-internals")]
+    cached_forest_rounds: bool,
 }
 
 /// The verifier's derived setup, the same two things.
@@ -123,7 +125,20 @@ pub enum VerifyError {
 impl BitZProver {
     pub fn new(params: BitZParams, window: usize) -> Self {
         let comb = FixedBasePow::new(params.generator(), 128, window);
-        Self { params, comb }
+        Self {
+            params,
+            comb,
+            #[cfg(feature = "bench-internals")]
+            cached_forest_rounds: true,
+        }
+    }
+
+    /// Selects the ordinary or cached pivotal-round prover in controlled
+    /// benchmarks. Production builds always use the cached prover.
+    #[cfg(feature = "bench-internals")]
+    pub fn with_cached_forest_rounds(mut self, cached: bool) -> Self {
+        self.cached_forest_rounds = cached;
+        self
     }
 
     pub fn params(&self) -> &BitZParams {
@@ -174,6 +189,16 @@ impl BitZProver {
             .map_err(ProveError::Fold)?;
         trace("fold+images", started);
         let started = std::time::Instant::now();
+        #[cfg(feature = "bench-internals")]
+        let query = reduce::gkr_reduce_prove_with_cached_rounds(
+            transcript,
+            &fold,
+            &shape,
+            hint,
+            self.cached_forest_rounds,
+        )
+        .map_err(ProveError::Reduction)?;
+        #[cfg(not(feature = "bench-internals"))]
         let query = reduce::gkr_reduce_prove(transcript, &fold, &shape, hint)
             .map_err(ProveError::Reduction)?;
         trace("gkr", started);
@@ -311,4 +336,3 @@ pub(crate) fn eq_factor(r: Gf, z: Gf) -> Gf {
     let one = Gf::one();
     r * z + (one - r) * (one - z)
 }
-

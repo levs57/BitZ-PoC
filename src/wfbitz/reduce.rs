@@ -98,6 +98,24 @@ pub(crate) fn gkr_reduce_prove(
     gkr_reduce_prove_packed(transcript, fold, shape, hint.packed_cols())
 }
 
+#[cfg(feature = "bench-internals")]
+pub(crate) fn gkr_reduce_prove_with_cached_rounds(
+    transcript: &mut ProverState,
+    fold: &Fold,
+    shape: &Shape,
+    hint: &FlockCommitHint,
+    cached_rounds: bool,
+) -> Result<OpeningQuery, ClaimError> {
+    let forest = Forest::new(
+        shape.log_rows(),
+        shape.log_columns(),
+        hint.packed_cols(),
+        &fold.row_images,
+    );
+    let (point, claim) = forest.prove_with_cached_rounds(transcript, &fold.zeta, cached_rounds);
+    query_from_terminal(fold, shape, point, claim)
+}
+
 /// [`gkr_reduce_prove`] over any grid's 64-lane packed columns
 /// (`packed_cols[g][b]` = bit `b` of columns `64g..64g+63`): the committed
 /// rows' packing, or a derived grid's for a virtual opening.

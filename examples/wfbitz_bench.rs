@@ -1,6 +1,7 @@
 //! The paper's raw-performance row for the BitZ parity prover at one size.
 //!
-//! `bitz_bench <n> [--reps R] [--seed S] [--ladder L]` builds a random instance at the
+//! `bitz_bench <n> [--reps R] [--seed S] [--ladder L] [--compare-cached-rounds]`
+//! builds a random instance at the
 //! scheme's split (`Shape::reference`: `t = ⌈3n/5⌉ − 1`, `s = n − t`,
 //! `q = 2^100 − 15`, generator `X`, the dump examples' transcript labels),
 //! commits it `R` times (median), proves it once to warm up and then `R`
@@ -63,11 +64,21 @@ fn peak_rss_bytes() -> u64 {
     usage.ru_maxrss as u64
 }
 
+struct ProverRun {
+    label: &'static str,
+    prover: BitZProver,
+    prove_times: Vec<Duration>,
+    verify_times: Vec<Duration>,
+    phase_times: Vec<(String, Vec<Duration>)>,
+    sizes: (usize, usize),
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut n: Option<usize> = None;
     let mut reps = 5usize;
     let mut seed = 1u64;
+    let mut compare_cached_rounds = false;
     // `fast` = flock's embedded ladder as shipped; otherwise one of the
     // crate's validated selections (`custom:1:4` = the paper's rate-1/2
     // Johnson ladder, `custom:3:4` = rate 1/8), resolved at 100 bits. No
@@ -89,13 +100,20 @@ fn main() {
                 seed = args[i + 1].parse().expect("--seed");
                 i += 2;
             }
+            "--compare-cached-rounds" => {
+                compare_cached_rounds = true;
+                i += 1;
+            }
             x => {
                 n = Some(x.parse().expect("n"));
                 i += 1;
             }
         }
     }
-    let n = n.expect("usage: bitz_bench <n> [--reps R] [--seed S] [--ladder fast|custom:r:k]");
+    let n = n.expect("usage: bitz_bench <n> [--reps R] [--seed S] [--ladder fast|custom:r:k] [--compare-cached-rounds]");
+    if compare_cached_rounds && !cfg!(feature = "bench-internals") {
+        panic!("--compare-cached-rounds requires --features bench-internals");
+    }
     let shape = Shape::reference(n).expect("shape");
     let (t, s) = (shape.log_rows(), shape.log_columns());
     let params = BitZParams::new(shape, Q, Gf::from_polynomial_words([2, 0])).expect("params");
@@ -147,63 +165,88 @@ fn main() {
     let commit = median(&commit_times);
     println!("commit: median {:.2} ms over {reps}", ms(commit));
 
-    // Prove: one warm-up, then `reps` timed and verified.
-    let prover = BitZProver::new(params, WINDOW);
+    // Prove: one warm-up per mode, then interleaved timed and verified runs.
+    let mut runs = Vec::new();
+    #[cfg(feature = "bench-internals")]
+    if compare_cached_rounds {
+        runs.push(ProverRun {
+            label: "ordinary",
+            prover: BitZProver::new(params, WINDOW).with_cached_forest_rounds(false),
+            prove_times: Vec::with_capacity(reps),
+            verify_times: Vec::with_capacity(reps),
+            phase_times: Vec::new(),
+            sizes: (0, 0),
+        });
+    }
+    let cached = BitZProver::new(params, WINDOW);
+    #[cfg(feature = "bench-internals")]
+    let cached = cached.with_cached_forest_rounds(true);
+    runs.push(ProverRun {
+        label: "cached-k2",
+        prover: cached,
+        prove_times: Vec::with_capacity(reps),
+        verify_times: Vec::with_capacity(reps),
+        phase_times: Vec::new(),
+        sizes: (0, 0),
+    });
     let verifier = BitZVerifier::new(params, WINDOW);
-    let mut prove_times = Vec::with_capacity(reps);
-    let mut verify_times = Vec::with_capacity(reps);
-    let mut phase_times: Vec<(String, Vec<Duration>)> = Vec::new();
-    let mut sizes = (0usize, 0usize);
     for rep in 0..=reps {
-        record_phases(true);
-        let started = Instant::now();
-        let mut transcript = build_prover(SESSION, INSTANCE);
-        prover.prove(&claim, &pcs, &hint, &mut transcript, None).expect("prove");
-        let proof = transcript.finish();
-        let elapsed = started.elapsed();
-        let phases = take_phases();
-        record_phases(false);
-        if rep == 0 {
-            continue;
-        }
-        prove_times.push(elapsed);
-        for (label, d) in phases {
-            match phase_times.iter_mut().find(|(l, _)| *l == label) {
-                Some((_, v)) => v.push(d),
-                None => phase_times.push((label, vec![d])),
+        for turn in 0..runs.len() {
+            let i = if rep & 1 == 0 { turn } else { runs.len() - 1 - turn };
+            let run = &mut runs[i];
+            record_phases(true);
+            let started = Instant::now();
+            let mut transcript = build_prover(SESSION, INSTANCE);
+            run.prover.prove(&claim, &pcs, &hint, &mut transcript, None).expect("prove");
+            let proof = transcript.finish();
+            let elapsed = started.elapsed();
+            let phases = take_phases();
+            record_phases(false);
+            if rep == 0 {
+                continue;
             }
+            run.prove_times.push(elapsed);
+            for (label, d) in phases {
+                match run.phase_times.iter_mut().find(|(l, _)| *l == label) {
+                    Some((_, v)) => v.push(d),
+                    None => run.phase_times.push((label, vec![d])),
+                }
+            }
+            let started = Instant::now();
+            verifier
+                .verify(&claim, &pcs, root, build_verifier(SESSION, INSTANCE, &proof), None)
+                .expect("verify");
+            run.verify_times.push(started.elapsed());
+            run.sizes = (proof.narg_string.len(), proof.hints.len());
         }
-        let started = Instant::now();
-        verifier
-            .verify(&claim, &pcs, root, build_verifier(SESSION, INSTANCE, &proof), None)
-            .expect("verify");
-        verify_times.push(started.elapsed());
-        sizes = (proof.narg_string.len(), proof.hints.len());
     }
-    let prove = median(&prove_times);
-    let verify = median(&verify_times);
-    let phase = |label: &str| -> Duration {
-        phase_times
-            .iter()
-            .find(|(l, _)| l == label)
-            .map_or(Duration::ZERO, |(_, v)| median(v))
-    };
-    let grand = phase("fold+images") + phase("gkr");
-    let ring = phase("sumcheck") + phase("ring switch");
-    let lig = phase("ligerito");
-    println!("prove: median {:.1} ms over {reps} (min {:.1}); phases:", ms(prove), ms(*prove_times.iter().min().expect("reps")));
-    for (label, v) in &phase_times {
-        println!("  {label:<24} {:>8.2} ms", ms(median(v)));
-    }
-    println!(
-        "buckets: grand products {:.1} | ring switch incl. sumcheck {:.1} | ligerito {:.1} | total {:.1} (commit {:.2} + prove {:.1})",
-        ms(grand), ms(ring), ms(lig), ms(commit + prove), ms(commit), ms(prove)
-    );
-    println!("verify: median {:.2} ms; proof: narg {} B + hints {} B = {} B", ms(verify), sizes.0, sizes.1, sizes.0 + sizes.1);
     let rss = peak_rss_bytes();
-    println!("peak rss: {:.2} GB", rss as f64 / 1e9);
-    println!(
-        "RESULT schema=bitz-bench/1 n={n} t={t} s={s} threads={threads} reps={reps} seed={seed} ladder={ladder} commit_ms={:.3} prove_ms={:.3} grand_ms={:.3} ring_ms={:.3} lig_ms={:.3} verify_ms={:.3} narg_bytes={} hints_bytes={} peak_rss_bytes={rss}",
-        ms(commit), ms(prove), ms(grand), ms(ring), ms(lig), ms(verify), sizes.0, sizes.1
-    );
+    for run in runs {
+        let prove = median(&run.prove_times);
+        let verify = median(&run.verify_times);
+        let phase = |label: &str| -> Duration {
+            run.phase_times
+                .iter()
+                .find(|(l, _)| l == label)
+                .map_or(Duration::ZERO, |(_, v)| median(v))
+        };
+        let grand = phase("fold+images") + phase("gkr");
+        let ring = phase("sumcheck") + phase("ring switch");
+        let lig = phase("ligerito");
+        println!("\nforest mode: {}", run.label);
+        println!("prove: median {:.1} ms over {reps} (min {:.1}); phases:", ms(prove), ms(*run.prove_times.iter().min().expect("reps")));
+        for (label, v) in &run.phase_times {
+            println!("  {label:<24} {:>8.2} ms", ms(median(v)));
+        }
+        println!(
+            "buckets: grand products {:.1} | ring switch incl. sumcheck {:.1} | ligerito {:.1} | total {:.1} (commit {:.2} + prove {:.1})",
+            ms(grand), ms(ring), ms(lig), ms(commit + prove), ms(commit), ms(prove)
+        );
+        println!("verify: median {:.2} ms; proof: narg {} B + hints {} B = {} B", ms(verify), run.sizes.0, run.sizes.1, run.sizes.0 + run.sizes.1);
+        println!("peak rss: {:.2} GB", rss as f64 / 1e9);
+        println!(
+            "RESULT schema=bitz-bench/1 forest={} n={n} t={t} s={s} threads={threads} reps={reps} seed={seed} ladder={ladder} commit_ms={:.3} prove_ms={:.3} grand_ms={:.3} ring_ms={:.3} lig_ms={:.3} verify_ms={:.3} narg_bytes={} hints_bytes={} peak_rss_bytes={rss}",
+            run.label, ms(commit), ms(prove), ms(grand), ms(ring), ms(lig), ms(verify), run.sizes.0, run.sizes.1
+        );
+    }
 }

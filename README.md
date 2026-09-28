@@ -404,7 +404,7 @@ round path, run:
 ```bash
 RUSTFLAGS="-C target-cpu=native -A warnings" RAYON_NUM_THREADS=1 \
   cargo run --release --no-default-features \
-  --features bitz-parity,bench-internals \
+  --features bitz-parity,bench-internals,parallel \
   --example wfbitz_bench -- 26 --reps 5 --ladder fast \
   --compare-cached-rounds
 ```
